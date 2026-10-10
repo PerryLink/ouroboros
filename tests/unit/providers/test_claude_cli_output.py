@@ -545,6 +545,54 @@ def test_rejects_missing_or_ambiguous_terminal_result(events: list[dict[str, obj
         normalize_claude_cli_output(json.dumps(events))
 
 
+def test_accepts_hook_lifecycle_events_before_init() -> None:
+    """A SessionStart hook reports itself before ``system/init`` (#2545).
+
+    ``hook_started`` and ``hook_response`` are ``system`` events with non-init
+    subtypes, so they used to set the activity flag and made the following
+    ``system/init`` look out of order.
+    """
+    normalized = normalize_claude_cli_output(
+        json.dumps(
+            [
+                {"type": "system", "subtype": "hook_started", "hook_event": "SessionStart"},
+                {
+                    "type": "system",
+                    "subtype": "hook_response",
+                    "hook_event": "SessionStart",
+                    "exit_code": 0,
+                    "outcome": "success",
+                },
+                {"type": "system", "subtype": "init", "session_id": "session-1"},
+                _result(),
+            ]
+        )
+    )
+
+    assert normalized.result == "done"
+
+
+@pytest.mark.parametrize(
+    "subtype",
+    [
+        pytest.param("something_new", id="unknown-subtype"),
+        pytest.param("rate_limit", id="known-non-hook-subtype"),
+    ],
+)
+def test_an_unrecognized_system_subtype_still_precedes_init_out_of_order(subtype: str) -> None:
+    """Only recognized hook lifecycle subtypes are exempt from the ordering check."""
+    with pytest.raises(ClaudeCliOutputError, match="duplicated or out of order"):
+        normalize_claude_cli_output(
+            json.dumps(
+                [
+                    {"type": "system", "subtype": subtype},
+                    {"type": "system", "subtype": "init", "session_id": "session-1"},
+                    _result(),
+                ]
+            )
+        )
+
+
 def test_rejects_session_id_disagreement_between_init_and_result() -> None:
     with pytest.raises(ClaudeCliOutputError, match="inconsistent session_id"):
         normalize_claude_cli_output(json.dumps(_events(_result(session_id="session-2"))))

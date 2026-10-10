@@ -290,6 +290,15 @@ def _flatten_events(documents: Sequence[Any]) -> list[dict[str, Any]]:
     return events
 
 
+# ``system`` subtypes the CLI emits as a hook reports its own startup.  They
+# arrive before ``system/init`` when a ``SessionStart`` hook is registered, so
+# they describe the startup sequence rather than any work the caller asked for.
+# Only these are exempt from the init-ordering check: an unrecognised or
+# execution-bearing ``system`` event still counts as activity, which keeps the
+# check as strict as before for everything else.
+_HOOK_LIFECYCLE_SUBTYPES = frozenset({"hook_started", "hook_response"})
+
+
 def _terminal_result(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     result_indexes: list[int] = []
     activity_seen = False
@@ -314,6 +323,14 @@ def _terminal_result(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
             if init_seen or activity_seen:
                 raise ClaudeCliOutputError("system/init event is duplicated or out of order")
             init_seen = True
+        elif event_type == "system" and event.get("subtype") in _HOOK_LIFECYCLE_SUBTYPES:
+            # A ``SessionStart`` hook reports itself before ``system/init``
+            # arrives: the CLI emits ``hook_started`` and ``hook_response``
+            # first.  Those are startup lifecycle notices, not work the caller
+            # asked for, so they do not make a later ``init`` out of order.
+            # Leaving them out of ``activity_seen`` is what keeps the ordering
+            # check meaningful for the events that do mean execution.
+            continue
         else:
             activity_seen = True
 
