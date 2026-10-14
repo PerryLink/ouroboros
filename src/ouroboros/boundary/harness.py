@@ -86,6 +86,52 @@ PARAM_REF = "$param"
 """The key of a template value that stands for a case's declared parameter (controller side)."""
 INPUT_FAILED_EXIT = 3
 PROJECTION_FAILED_EXIT = 4
+
+
+def _safe_text(value: Any, limit: int = MAX_REPR, prefer: Any = None) -> str:
+    """Render ``value`` for a diagnostic field without letting it end the case.
+
+    ``repr()`` runs project code. Django's ``ValidationError``, for one, renders its message
+    through the translation machinery, which raises ``ImproperlyConfigured`` when no
+    settings are configured -- the situation in this harness, which configures none.
+    An unguarded render then kills the target before it writes its ``result`` frame,
+    and a case that should have passed is counted as failed.
+
+    ``prefer`` names the renderer to try first, so each call site keeps whichever of
+    ``repr``/``str`` it used before; the two disagree on ordinary values
+    (``repr(KeyError("k"))`` is ``KeyError('k')``, ``str`` is ``'k'``), and changing that text
+    for values that render fine would be an unrelated change. The other renderer is
+    still tried as the first fallback.
+
+    The exception's identity is recorded separately, from ``type(...).__mro__``, and
+    comparison reads only those class names; this text is diagnostic only, so falling
+    back here cannot make any case pass.
+
+    ``args`` is read inside the guard too. It is a property on some exceptions, so
+    fetching it or iterating it can raise the way a renderer can, and a fallback that
+    raises is not a fallback; every step below is inside a ``try`` for that reason.
+    """
+    renders = (prefer, repr, str) if prefer is not None else (repr, str)
+    for render in renders:
+        try:
+            return render(value)[:limit]
+        except BaseException:
+            continue
+    try:
+        items = list(getattr(value, "args", ()) or ())
+    except BaseException:
+        items = []
+    parts = []  # type: List[str]
+    for item in items:
+        try:
+            parts.append(repr(item))
+        except BaseException:
+            parts.append("<unrenderable>")
+    if parts:
+        return (type(value).__name__ + ": " + ", ".join(parts))[:limit]
+    return ("<" + type(value).__name__ + ": message not renderable>")[:limit]
+
+
 # Python 3.5 has no ModuleNotFoundError (see ``_module_not_found``).
 _MODULE_NOT_FOUND = getattr(builtins, "ModuleNotFoundError", None)
 
@@ -408,7 +454,7 @@ def _run(target: Any, kind: str, call: Dict[str, Any]) -> Dict[str, Any]:
             "case_id": call["case_id"],
             "outcome": "raised",
             "exception": [klass.__name__ for klass in type(exc).__mro__],
-            "repr": (type(exc).__name__ + ": " + str(exc))[:MAX_REPR],
+            "repr": (type(exc).__name__ + ": " + _safe_text(exc, prefer=str))[:MAX_REPR],
         }
     if call.get("project"):
         try:
@@ -416,7 +462,7 @@ def _run(target: Any, kind: str, call: Dict[str, Any]) -> Dict[str, Any]:
         except BaseException:
             # A read the returned value does not support: no observation.
             os._exit(PROJECTION_FAILED_EXIT)
-    entry = {"case_id": call["case_id"], "outcome": "returned", "repr": repr(value)[:MAX_REPR]}
+    entry = {"case_id": call["case_id"], "outcome": "returned", "repr": _safe_text(value)}
     try:
         entry["value"] = _plain(value)
         entry["encodable"] = True
@@ -453,7 +499,13 @@ def _target(nonce: str, kind: str, symbol: str, setup: str) -> None:
     try:
         _setup(json.loads(setup))
     except _Unprovable as exc:
-        frame({"phase": "resolved", "resolve": "unprovable", "detail": str(exc)[:500]})
+        frame(
+            {
+                "phase": "resolved",
+                "resolve": "unprovable",
+                "detail": _safe_text(exc, 500, prefer=str),
+            }
+        )
         os._exit(0)
     except BaseException as exc:
         # A failed setup is never the target missing: on the base it is
@@ -462,25 +514,35 @@ def _target(nonce: str, kind: str, symbol: str, setup: str) -> None:
             {
                 "phase": "resolved",
                 "resolve": "import_error",
-                "detail": ("setup: " + type(exc).__name__ + ": " + str(exc))[:500],
+                "detail": (
+                    "setup: " + type(exc).__name__ + ": " + _safe_text(exc, 500, prefer=str)
+                )[:500],
             }
         )
         os._exit(0)
     try:
         target = _resolve(symbol, kind)
     except _Missing as exc:
-        frame({"phase": "resolved", "resolve": "missing", "detail": str(exc)[:500]})
+        frame(
+            {"phase": "resolved", "resolve": "missing", "detail": _safe_text(exc, 500, prefer=str)}
+        )
         os._exit(0)
     except _Unprovable as exc:
         # Neither missing nor resolved: the check cannot decide on this host.
-        frame({"phase": "resolved", "resolve": "unprovable", "detail": str(exc)[:500]})
+        frame(
+            {
+                "phase": "resolved",
+                "resolve": "unprovable",
+                "detail": _safe_text(exc, 500, prefer=str),
+            }
+        )
         os._exit(0)
     except BaseException as exc:
         frame(
             {
                 "phase": "resolved",
                 "resolve": "import_error",
-                "detail": (type(exc).__name__ + ": " + str(exc))[:500],
+                "detail": (type(exc).__name__ + ": " + _safe_text(exc, 500, prefer=str))[:500],
             }
         )
         os._exit(0)
@@ -588,7 +650,13 @@ def _cli(nonce: str, kind: str, name: str, workdir: str, count: str, rest: List[
     try:
         files = _proven_files(rest[: 4 * number])
     except (_Unprovable, OSError, ValueError) as exc:
-        frame({"phase": "resolved", "resolve": "unprovable", "detail": str(exc)[:500]})
+        frame(
+            {
+                "phase": "resolved",
+                "resolve": "unprovable",
+                "detail": _safe_text(exc, 500, prefer=str),
+            }
+        )
         os._exit(0)
     frame({"phase": "resolved", "resolve": "ok", "detail": ""})
     null = os.open(os.devnull, os.O_WRONLY)
@@ -710,7 +778,7 @@ def cli_argv(
 
 
 def _short(value: Any) -> str:
-    text = repr(value)
+    text = _safe_text(value)
     return text if len(text) <= MAX_REPR else text[:MAX_REPR] + "..."
 
 

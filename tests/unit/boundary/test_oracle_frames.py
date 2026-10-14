@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from ouroboros.boundary import admission as admission_module
-from ouroboros.boundary import check_env
+from ouroboros.boundary import check_env, harness
 from ouroboros.boundary.admission import verify_candidate
 from ouroboros.boundary.check_env import CheckCommand
 from ouroboros.boundary.oracle_run import parse_frame, valid_entry
@@ -265,3 +265,56 @@ async def test_a_target_s_children_are_killed_after_the_target_exits(tmp_path: P
     while time.monotonic() < deadline:
         await asyncio.sleep(0.25)
     assert not marker.exists()
+
+
+# A raised exception whose every rendering path is hostile, `args` included. The
+# first version of the diagnostic fallback read `args` outside its guard, so an
+# exception like this still escaped `_run` and the target wrote no result frame --
+# the case failed instead of being decided. `args` is a property on some real
+# exceptions, so fetching it has to sit inside the same guard as the renderers.
+HOSTILE = (
+    "class Hostile(Exception):\n"
+    "    def __str__(self):\n"
+    "        raise RuntimeError('str blew up')\n"
+    "    def __repr__(self):\n"
+    "        raise RuntimeError('repr blew up')\n"
+    "    @property\n"
+    "    def args(self):\n"
+    "        raise RuntimeError('args blew up')\n"
+    "\n"
+    "def boom():\n"
+    "    raise Hostile()\n"
+)
+
+CALL = {"case_id": "c1", "args": [], "kwargs": {}}
+
+
+def test_an_exception_whose_args_raise_still_yields_a_raised_outcome() -> None:
+    namespace: dict[str, Any] = {}
+    exec(HOSTILE, namespace)  # noqa: S102 - a fixture module, as the other cases build theirs
+    entry = harness._run(namespace["boom"], "function", dict(CALL))
+    assert entry["outcome"] == "raised"
+    # Identity survives whatever the message does; that is what comparison reads.
+    assert "Hostile" in entry["exception"]
+    # The site prefixes the type name and `_safe_text` names it again in the marker, which is
+    # the shape every other fallback already has; the point is that it returns at all.
+    assert entry["repr"] == "Hostile: <Hostile: message not renderable>"
+
+
+def test_an_exception_with_only_args_renderable_still_reports_them() -> None:
+    namespace: dict[str, Any] = {}
+    exec(
+        "class Loud(Exception):\n"
+        "    def __str__(self):\n"
+        "        raise RuntimeError('str blew up')\n"
+        "    def __repr__(self):\n"
+        "        raise RuntimeError('repr blew up')\n"
+        "    args = ('kept', 7)\n"
+        "\n"
+        "def boom():\n"
+        "    raise Loud()\n",
+        namespace,
+    )
+    entry = harness._run(namespace["boom"], "function", dict(CALL))
+    assert entry["outcome"] == "raised"
+    assert entry["repr"] == "Loud: Loud: 'kept', 7"
