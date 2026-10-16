@@ -18,6 +18,7 @@ import structlog
 import yaml
 
 from ouroboros.auto.intent_guard import IntentGuardReport, IntentGuardStatus, guard_interview_turn
+from ouroboros.auto.requester import REQUESTER_ANSWER_PREFIX
 from ouroboros.backends import (
     backend_supports_tool_envelope,
 )
@@ -769,6 +770,8 @@ def _classify_interview_answer_source(answer: str) -> str:
     lowered = str(answer).lstrip().casefold()
     if lowered.startswith("[from-code]") or lowered.startswith("[from-repo]"):
         return "repo_fact"
+    if lowered.startswith(REQUESTER_ANSWER_PREFIX):  # auto relays the requester's own answer
+        return "requester"
     if lowered.startswith("[from-auto]") or lowered.startswith("[from-safe-default]"):
         return "generated"
     if lowered.startswith("[from-assumption]") or lowered.startswith("[from-inference]"):
