@@ -106,6 +106,7 @@ from ouroboros.orchestrator.atomic_prompt_builder import (
     AtomicPromptBuilder,
     _build_success_contract_block,  # noqa: F401  (re-exported for tests/back-compat)
 )
+from ouroboros.orchestrator.attempt_evidence import attempt_workspace_evidence, judgment_envelope_ok
 from ouroboros.orchestrator.backend_limits import (
     BackendConcurrencyLimits,
     resolve_backend_limits,
@@ -431,6 +432,7 @@ from ouroboros.orchestrator.verifier import (
     VerifierVerdict,
     verifier_operational_failure_verdict,
 )
+from ouroboros.orchestrator.verify_base_signal import VerifyBaseSignal, no_signal_outcome
 from ouroboros.orchestrator.verify_command_runner import run_with_shell
 from ouroboros.orchestrator.verify_gate_outcome import (
     _VERIFY_OUTPUT_TAIL_CHARS,
@@ -2797,6 +2799,8 @@ class ParallelACExecutor:
         # the live switch (``runtime.exec_sandbox.sandbox_enabled``).
         self._exec_sandbox_enabled = exec_sandbox_enabled
         self._verify_command_timeout_seconds = max(1, verify_command_timeout_seconds)
+        # Base snapshot check for failing verify commands; the runner installs it.
+        self._verify_base_signal = VerifyBaseSignal()
         # AC worker tasks currently executing against the shared workspace.
         # The verify gate reads this to tell "my verify_command wrote" apart
         # from "a sibling worker wrote while my command ran".
@@ -9857,6 +9861,12 @@ Respond with either ATOMIC or the structured JSON object only.
         if mutated is not None:
             return mutated
         returncode = run.returncode
+        if returncode != 0 and await self._verify_base_signal.fails_on_base(
+            command,
+            shell_path=verify_shell_path,
+            timeout_seconds=self._verify_command_timeout_seconds,
+        ):
+            return no_signal_outcome(returncode, tail, workspace_digest(), replay_required)
         if returncode != 0:
             return _VerifyGateOutcome(
                 passed=False,
@@ -10106,6 +10116,7 @@ Respond with either ATOMIC or the structured JSON object only.
                     "call_site": "parallel",
                 }
             )
+        event_data.update(await attempt_workspace_evidence(self, result))
         event = BaseEvent(
             type="execution.ac.attempt_judged",
             aggregate_type="execution",
@@ -12175,7 +12186,7 @@ Respond with either ATOMIC or the structured JSON object only.
             # not participate in this replay episode.
             if data.get("route_contract_version") is None:
                 continue
-            if not _mapping_has_exact_keys(data, _PARALLEL_ROUTE_JUDGMENT_KEYS):
+            if not judgment_envelope_ok(data, _PARALLEL_ROUTE_JUDGMENT_KEYS):
                 raise RuntimeError("route-aware attempt judgment has an invalid event envelope")
             root_ac_index = data.get("root_ac_index")
             route_episode_id = data.get("route_episode_id")
