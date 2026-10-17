@@ -25,7 +25,11 @@ from ouroboros.auto.ledger import (
     LedgerStatus,
     SeedDraftLedger,
 )
-from ouroboros.auto.ledger_seed import synthesize_seed_from_ledger, with_ledger_assumptions
+from ouroboros.auto.ledger_seed import (
+    ledger_assumptions,
+    synthesize_seed_from_ledger,
+    with_ledger_assumptions,
+)
 from ouroboros.auto.requester import RequesterQuestion, RequesterReply
 from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore
 from ouroboros.bigbang.answer_provenance import (
@@ -539,3 +543,133 @@ def test_worker_system_prompt_carries_assumptions_outside_the_per_ac_fence() -> 
     assert DEFAULTED_CONSTRAINT in assumptions_block
     assert "override the assumption" in assumptions_block
     assert "responsible only for the current acceptance criterion" not in prompt
+
+
+# -- an unconfirmed answer reaches the worker as its open question only --------
+
+SCOPE_QUESTION = "Should DateField and TimeField arithmetic be covered too?"
+
+
+def _ledger_with_asked_draft() -> SeedDraftLedger:
+    ledger = _ready_ledger()
+    ledger.add_entry(
+        "acceptance_criteria",
+        LedgerEntry(
+            key="acceptance_criteria.field_scope",
+            value="Only DateTimeField subtraction is in scope",
+            source=LedgerSource.ASSUMPTION,
+            confidence=0.7,
+            status=LedgerStatus.DEFAULTED,
+            question=SCOPE_QUESTION,
+        ),
+    )
+    return ledger
+
+
+def test_unconfirmed_answer_to_an_asked_question_renders_only_the_question() -> None:
+    seed = synthesize_seed_from_ledger(_ledger_with_asked_draft())
+
+    assert f"Open question: {SCOPE_QUESTION}" in seed.assumptions
+    assert all("Only DateTimeField subtraction" not in item for item in seed.assumptions)
+    # An entry no interview question produced keeps its value.
+    assert UNSPECIFIED_DRAFT_CRITERION in seed.assumptions
+    prompt = render_seed_contract_for_execution(SeedContract.from_seed(seed))
+    assert "Only DateTimeField subtraction" not in prompt
+    assert SCOPE_QUESTION in prompt
+
+
+def test_a_binding_answer_is_never_reduced_to_its_question() -> None:
+    ledger = _ready_ledger()
+    ledger.add_entry(
+        "constraints",
+        LedgerEntry(
+            key="constraints.fields.requester",
+            value="Cover DateField, TimeField and DateTimeField",
+            source=LedgerSource.USER_PREFERENCE,
+            confidence=0.83,
+            status=LedgerStatus.CONFIRMED,
+            question=SCOPE_QUESTION,
+        ),
+    )
+
+    seed = synthesize_seed_from_ledger(ledger)
+
+    assert "Cover DateField, TimeField and DateTimeField" in seed.constraints
+    assert all(SCOPE_QUESTION not in item for item in seed.assumptions)
+
+
+def test_ledger_entry_question_round_trips_and_is_omitted_when_empty() -> None:
+    asked = LedgerEntry(
+        key="k", value="v", source="assumption", confidence=0.5, status="defaulted", question="Q?"
+    )
+    unasked = LedgerEntry(
+        key="k", value="v", source="assumption", confidence=0.5, status="defaulted"
+    )
+
+    assert LedgerEntry.from_dict(asked.to_dict()).question == "Q?"
+    assert "question" not in unasked.to_dict()
+
+
+@pytest.mark.asyncio
+async def test_draft_kept_after_unanswered_requester_carries_its_question(
+    tmp_path: Path,
+) -> None:
+    """The study case: the requester could not answer, so auto kept its draft."""
+    backend = _RecordingBackend()
+    driver = AutoInterviewDriver(
+        backend,
+        store=AutoStore(tmp_path / "store"),
+        max_rounds=1,
+        requester=_StubRequester(RequesterReply("empty_answer", detail="empty stdout")),
+    )
+    state = AutoPipelineState(goal=GOAL, cwd=str(tmp_path))
+    state.transition(AutoPhase.INTERVIEW, "interview")
+
+    result = await driver.run(state, SeedDraftLedger.from_goal(GOAL))
+
+    asked = [
+        entry
+        for section in result.ledger.sections.values()
+        for entry in section.entries
+        if entry.question == FIRST_QUESTION
+    ]
+    assert asked, "the kept draft must remember the question it answered"
+    assert all(not entry.binds_seed for entry in asked)
+    rendered = ledger_assumptions(result.ledger)
+    assert f"Open question: {FIRST_QUESTION}" in rendered
+    for entry in asked:
+        assert all(entry.value.strip() not in line for line in rendered)
+
+
+def test_assumptions_block_puts_the_issue_and_code_over_any_assumption() -> None:
+    seed = synthesize_seed_from_ledger(_ledger_with_asked_draft())
+
+    prompt = render_seed_contract_for_execution(SeedContract.from_seed(seed))
+
+    header = prompt.split("## Assumptions (non-binding)", 1)[1].split("\n- ", 1)[0]
+    assert "a default only where the code itself settles nothing" in header
+    assert "follow the issue and the code over any assumption" in header
+
+
+def test_a_driver_gap_reopen_prompt_is_not_recorded_as_an_asked_question() -> None:
+    from ouroboros.auto.answerer import AutoAnswerer
+
+    def draft() -> AutoAnswer:
+        entry = LedgerEntry(
+            key="constraints.scope",
+            value="Only the CLI is in scope",
+            source=LedgerSource.ASSUMPTION,
+            confidence=0.6,
+            status=LedgerStatus.DEFAULTED,
+        )
+        return AutoAnswer(entry.value, AutoAnswerSource.ASSUMPTION, 0.6, [("constraints", entry)])
+
+    answered = SeedDraftLedger.from_goal(GOAL)
+    AutoAnswerer().apply(draft(), answered, question=SCOPE_QUESTION, asked=SCOPE_QUESTION)
+    reopened = SeedDraftLedger.from_goal(GOAL)
+    AutoAnswerer().apply(
+        draft(), reopened, question="[driver gap-reopen 'constraints']", asked=SCOPE_QUESTION
+    )
+
+    assert answered.sections["constraints"].entries[-1].question == SCOPE_QUESTION
+    assert reopened.sections["constraints"].entries[-1].question == ""

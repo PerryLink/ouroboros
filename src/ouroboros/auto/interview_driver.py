@@ -1275,7 +1275,7 @@ class AutoInterviewDriver:
         # deterministically re-computes the same answer, and the next
         # ``backend.answer`` attempt either succeeds (round completes
         # cleanly) or returns the same blocker.
-        self.answerer.apply(answer, ledger, question=question_for_record)
+        self.answerer.apply(answer, ledger, question=question_for_record, asked=turn.question)
 
         answer_session_id = turn.session_id
 

@@ -357,6 +357,7 @@ from ouroboros.orchestrator.model_routing import (
     serialize_model_router,
     tier_from_profile_hint,
 )
+from ouroboros.orchestrator.no_evidence_route import NoEvidenceRoute
 from ouroboros.orchestrator.parallel_executor_models import (
     ACExecutionOutcome,
     ACExecutionResult,
@@ -432,7 +433,7 @@ from ouroboros.orchestrator.verifier import (
     VerifierVerdict,
     verifier_operational_failure_verdict,
 )
-from ouroboros.orchestrator.verify_base_signal import VerifyBaseSignal, no_signal_outcome
+from ouroboros.orchestrator.verify_base_signal import VerifyBaseSignal
 from ouroboros.orchestrator.verify_command_runner import run_with_shell
 from ouroboros.orchestrator.verify_gate_outcome import (
     _VERIFY_OUTPUT_TAIL_CHARS,
@@ -2554,6 +2555,7 @@ def render_parallel_verification_report(
         if (
             isinstance(result.verify_gate_outcome, _VerifyGateOutcome)
             and result.verify_gate_outcome.environment_unverifiable
+            and result.success  # a no-evidence attempt is quarantined but BLOCKED
         )
         or (
             result.atomic_verifier_verdict is not None
@@ -2805,6 +2807,7 @@ class ParallelACExecutor:
         # The verify gate reads this to tell "my verify_command wrote" apart
         # from "a sibling worker wrote while my command ran".
         self._inflight_ac_workers = 0
+        self._no_evidence = NoEvidenceRoute()  # code-task attempts that left no evidence
         if isinstance(verify_shell_identity, _AutoVerifyShell):
             verify_shell = resolve_verify_shell()
             self._verify_shell_identity = (
@@ -3884,6 +3887,7 @@ class ParallelACExecutor:
         )
 
         start_time = datetime.now(UTC)
+        await self._no_evidence.start(self._task_cwd or self._adapter.working_directory or ".")
         all_results: list[ACExecutionResult] = []
         failed_indices: set[int] = set()
         blocked_indices: set[int] = set()
@@ -9866,7 +9870,9 @@ Respond with either ATOMIC or the structured JSON object only.
             shell_path=verify_shell_path,
             timeout_seconds=self._verify_command_timeout_seconds,
         ):
-            return no_signal_outcome(returncode, tail, workspace_digest(), replay_required)
+            return self._verify_base_signal.no_signal(
+                returncode, tail, workspace_digest(), replay_required
+            )
         if returncode != 0:
             return _VerifyGateOutcome(
                 passed=False,
@@ -9910,7 +9916,9 @@ Respond with either ATOMIC or the structured JSON object only.
         result = await self._apply_verify_command(seed=seed, ac_index=ac_index, **kwargs)
         if result.success and (gate := getattr(self, "check_package_gate", None)) is not None:
             result = await gate(seed=seed, ac_index=ac_index, **{**kwargs, "result": result})
-        return result
+        return await self._no_evidence.route(
+            self, seed=seed, ac_index=ac_index, **{**kwargs, "result": result}
+        )
 
     async def _apply_verify_command(
         self,

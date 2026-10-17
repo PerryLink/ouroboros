@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import re
 from typing import TYPE_CHECKING
@@ -327,8 +327,22 @@ class AutoAnswerer:
             blocker=blocker,
         )
 
-    def apply(self, answer: AutoAnswer, ledger: SeedDraftLedger, *, question: str) -> None:
-        """Apply answer updates to ``ledger``."""
+    def apply(
+        self,
+        answer: AutoAnswer,
+        ledger: SeedDraftLedger,
+        *,
+        question: str,
+        asked: str | None = None,
+    ) -> None:
+        """Apply answer updates to ``ledger``.
+
+        ``asked`` is the interviewer's current question. When the answer
+        replies to it (``question`` is that question, not a driver gap-reopen
+        prompt), it is kept on each new entry (``LedgerEntry.question``) so an
+        unconfirmed entry can reach the worker as the open question instead of
+        the drafted answer.
+        """
         ledger.record_qa(question, answer.prefixed_text)
         if answer.blocker is not None:
             ledger.add_entry(
@@ -344,6 +358,8 @@ class AutoAnswerer:
                 ),
             )
         for section, entry in answer.ledger_updates:
+            if asked and asked == question and not entry.question:
+                entry = replace(entry, question=asked)
             ledger.add_entry(section, entry)
 
     def _non_goal_answer(self, question: str, ledger: SeedDraftLedger) -> AutoAnswer:  # noqa: ARG002
