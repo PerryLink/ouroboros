@@ -37,8 +37,10 @@ Custom CLI Path:
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -70,6 +72,17 @@ _AGY_DEFAULT_PERMISSION_MODE = "acceptEdits"
 _SENTINEL_MODEL = "default"
 
 
+class _ResumeUnavailable(ValueError):
+    """An explicit conversation cannot be safely resumed after runtime drift."""
+
+
+class _ConversationMismatch(ValueError):
+    def __init__(self, requested: str, observed: str) -> None:
+        super().__init__("Antigravity returned a different conversation than requested.")
+        self.requested = requested
+        self.observed = observed
+
+
 class AntigravityCLIRuntime(GeminiCLIRuntime):
     """Agent runtime that shells out to the locally installed Antigravity CLI.
 
@@ -79,7 +92,7 @@ class AntigravityCLIRuntime(GeminiCLIRuntime):
 
     - ``agy -p`` headless invocation with ``--dangerously-skip-permissions``
     - Structured stdout normalized by :class:`AntigravityEventNormalizer`
-    - No session resumption (stateless execution model)
+    - Targeted native conversation resumption with ``--conversation``
     """
 
     _runtime_handle_backend = "antigravity_cli"
@@ -94,7 +107,7 @@ class AntigravityCLIRuntime(GeminiCLIRuntime):
     # requests, matching the Hermes runtime's convention.
     _default_llm_backend = "claude_code"
     _tempfile_prefix = "ouroboros-antigravity-"
-    _max_resume_retries = 0  # agy print mode does not support targeted resume
+    _max_resume_retries = 0  # Never retry a failed resume as a fresh conversation.
 
     def _extract_event_session_id(self, event: dict[str, Any]) -> str | None:
         """Trust canonical native identity; preserve legacy Gemini extraction."""
@@ -137,6 +150,81 @@ class AntigravityCLIRuntime(GeminiCLIRuntime):
         if metadata.get("text_delta"):
             messages = [replace(m, data={**m.data, "text_delta": True}) for m in messages]
         return messages
+
+    async def _execute_task_impl(
+        self,
+        prompt: str,
+        tools: list[str] | None = None,
+        system_prompt: str | None = None,
+        resume_handle: RuntimeHandle | None = None,
+        resume_session_id: str | None = None,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+        _resume_depth: int = 0,
+    ) -> AsyncIterator[AgentMessage]:
+        """Reject a resumed stream that reports another native conversation."""
+        requested_handle = resume_handle or self._build_runtime_handle(resume_session_id)
+        stream = super()._execute_task_impl(
+            prompt=prompt,
+            tools=tools,
+            system_prompt=system_prompt,
+            resume_handle=resume_handle,
+            resume_session_id=resume_session_id,
+            reasoning_effort=reasoning_effort,
+            model=model,
+            _resume_depth=_resume_depth,
+        )
+        try:
+            async with aclosing(cast(AsyncGenerator[AgentMessage, None], stream)):
+                async for message in stream:
+                    yield message
+        except _ResumeUnavailable as error:
+            yield AgentMessage(
+                type="result",
+                content=str(error),
+                data={"subtype": "error", "terminal": True, "error_type": "ResumeUnavailable"},
+                resume_handle=requested_handle,
+            )
+        except _ConversationMismatch as error:
+            yield AgentMessage(
+                type="result",
+                content=str(error),
+                data={
+                    "subtype": "error",
+                    "terminal": True,
+                    "error_type": "ConversationMismatch",
+                    "requested_session_id": error.requested,
+                    "observed_session_id": error.observed,
+                },
+                resume_handle=requested_handle,
+            )
+
+    def _resolve_resume_session_id(self, current_handle: RuntimeHandle | None) -> str | None:
+        session_id = super()._resolve_resume_session_id(current_handle)
+        if current_handle and current_handle.native_session_id and session_id is None:
+            raise _ResumeUnavailable(
+                "Cannot resume the requested Antigravity conversation after runtime inputs changed."
+            )
+        return session_id
+
+    def _prepare_runtime_event(
+        self,
+        event: dict[str, Any],
+        *,
+        previous_handle: RuntimeHandle | None,
+        current_handle: RuntimeHandle | None,
+        session_rebound: bool,
+    ) -> dict[str, Any]:
+        requested = previous_handle.native_session_id if previous_handle else None
+        observed = self._extract_event_session_id(event)
+        if requested and observed and requested != observed:
+            raise _ConversationMismatch(requested, observed)
+        return super()._prepare_runtime_event(
+            event,
+            previous_handle=previous_handle,
+            current_handle=current_handle,
+            session_rebound=session_rebound,
+        )
 
     # -- Permission mode overrides -----------------------------------------
 
@@ -201,7 +289,7 @@ class AntigravityCLIRuntime(GeminiCLIRuntime):
         - ``--model`` is forwarded only for an explicit, non-sentinel id;
           ``agy`` otherwise uses its own configured default.
         """
-        del output_last_message_path, resume_session_id, runtime_handle, reasoning_effort
+        del output_last_message_path, reasoning_effort
 
         command = [
             self._cli_path,
@@ -211,6 +299,9 @@ class AntigravityCLIRuntime(GeminiCLIRuntime):
             "--output-format",
             "stream-json",
         ]
+        session_id = resume_session_id or self._resolve_resume_session_id(runtime_handle)
+        if session_id:
+            command.extend(["--conversation", session_id])
         normalized_model = self._normalize_model(self._model)
         if normalized_model and normalized_model != _SENTINEL_MODEL:
             command.extend(["--model", normalized_model])
@@ -248,13 +339,14 @@ class AntigravityCLIRuntime(GeminiCLIRuntime):
         """Declare the Antigravity CLI runtime feature contract.
 
         ``agy -p --output-format stream-json`` exposes structured tool events.
-        Targeted resume is not yet wired here; recovery happens at the Ouroboros checkpoint/lineage layer.
+        Targeted resume uses the native ``--conversation`` option. Unsupported
+        CLI versions fail explicitly and are never retried as fresh sessions.
         Tool restrictions and the system prompt are composed into the user
         message by the inherited prompt builder rather than enforced natively.
         """
         return RuntimeCapabilities(
             skill_dispatch=True,
-            targeted_resume=False,
+            targeted_resume=True,
             structured_output=True,
             system_prompt_support=ParamSupport.TRANSLATED,
             tool_restriction_support=ParamSupport.TRANSLATED,

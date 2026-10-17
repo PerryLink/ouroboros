@@ -181,10 +181,10 @@ def test_runtime_identity_is_antigravity() -> None:
     assert runtime.runtime_backend == "antigravity_cli"  # the handle name
 
 
-def test_capabilities_mark_structured_output_and_no_resume() -> None:
+def test_capabilities_mark_structured_output_and_targeted_resume() -> None:
     runtime = _make_runtime()
     assert runtime.capabilities.skill_dispatch is True
-    assert runtime.capabilities.targeted_resume is False
+    assert runtime.capabilities.targeted_resume is True
     assert runtime.capabilities.structured_output is True
     assert runtime.capabilities.system_prompt_support is ParamSupport.TRANSLATED
     assert runtime.capabilities.tool_restriction_support is ParamSupport.TRANSLATED
@@ -414,6 +414,266 @@ def test_plain_text_fallback_reports_unknown_tool_usage() -> None:
     assert event["content"] == "Wrapped CLI response"
     warning.assert_called_once()
     assert "unknown" in warning.call_args.kwargs["limitation"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("from_handle", [False, True])
+async def test_native_resume_forwards_requested_conversation(from_handle: bool) -> None:
+    import json
+
+    runtime = _make_runtime()
+    handle = runtime._build_runtime_handle("requested-native-session") if from_handle else None
+    calls = []
+
+    async def fake_exec(*command: str, **kwargs: object) -> _FakeProcess:
+        calls.append(command)
+        assert command[command.index("--conversation") + 1] == "requested-native-session"
+        return _FakeProcess(
+            [
+                json.dumps(
+                    {
+                        "event": "result",
+                        "result": {
+                            "conversation_id": "requested-native-session",
+                            "status": "SUCCESS",
+                            "response": "continued",
+                        },
+                    }
+                )
+            ]
+        )
+
+    with patch(
+        "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+        side_effect=fake_exec,
+    ):
+        result = await runtime.execute_task_to_result(
+            "continue",
+            resume_handle=handle,
+            resume_session_id=None if from_handle else "requested-native-session",
+        )
+    assert result.is_ok
+    assert result.value.session_id == "requested-native-session"
+    assert result.value.final_message == "continued"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_unsupported_resume_cli_fails_without_fresh_session_retry() -> None:
+    runtime = _make_runtime()
+    calls = []
+
+    async def fake_exec(*command: str, **kwargs: object) -> _FakeProcess:
+        calls.append(command)
+        assert "--conversation" in command
+        process = _FakeProcess([], returncode=2)
+        process.stderr = _FakeStream(["unknown flag: --conversation"])
+        return process
+
+    with patch(
+        "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+        side_effect=fake_exec,
+    ):
+        result = await runtime.execute_task_to_result(
+            "continue", resume_session_id="native-session"
+        )
+    assert result.is_err
+    assert "conversation" in str(result.error)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("from_handle", [False, True])
+@pytest.mark.parametrize("mismatch_event", ["init", "result"])
+async def test_resume_rejects_another_conversation(from_handle: bool, mismatch_event: str) -> None:
+    import json
+
+    runtime = _make_runtime()
+    handle = runtime._build_runtime_handle("requested-session") if from_handle else None
+    calls = []
+    event = (
+        {"event": "init", "conversation_id": "wrong-session", "init": {"cwd": "/tmp"}}
+        if mismatch_event == "init"
+        else {
+            "event": "result",
+            "result": {
+                "conversation_id": "wrong-session",
+                "status": "SUCCESS",
+                "response": "unrelated response",
+            },
+        }
+    )
+
+    async def fake_exec(*command: str, **kwargs: object) -> _FakeProcess:
+        calls.append(command)
+        return _FakeProcess([json.dumps(event)])
+
+    with (
+        patch(
+            "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+            side_effect=fake_exec,
+        ),
+        patch.object(runtime, "_terminate_process") as terminate,
+        patch.object(runtime, "_process_group_id", return_value=None),
+    ):
+        messages = [
+            message
+            async for message in runtime.execute_task(
+                "continue",
+                resume_handle=handle,
+                resume_session_id=None if from_handle else "requested-session",
+            )
+        ]
+    terminate.assert_awaited_once()
+    assert len(calls) == 1
+    assert messages[-1].is_error
+    assert messages[-1].data["error_type"] == "ConversationMismatch"
+    assert messages[-1].resume_handle.native_session_id == "requested-session"
+    assert all("unrelated response" not in message.content for message in messages)
+    assert not any(message.is_final and not message.is_error for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resumes_keep_identity_checks_isolated() -> None:
+    import asyncio
+    import json
+
+    runtime = _make_runtime()
+
+    async def fake_exec(*command: str, **kwargs: object) -> _FakeProcess:
+        requested = command[command.index("--conversation") + 1]
+        await asyncio.sleep(0)
+        return _FakeProcess(
+            [
+                json.dumps(
+                    {
+                        "event": "result",
+                        "result": {
+                            "conversation_id": "other" if requested == "reject" else requested,
+                            "status": "SUCCESS",
+                            "response": "continued",
+                        },
+                    }
+                )
+            ]
+        )
+
+    with (
+        patch(
+            "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+            side_effect=fake_exec,
+        ),
+        patch.object(runtime, "_terminate_process"),
+        patch.object(runtime, "_process_group_id", return_value=None),
+    ):
+        rejected, matched = await asyncio.gather(
+            runtime.execute_task_to_result("continue", resume_session_id="reject"),
+            runtime.execute_task_to_result("continue", resume_session_id="accept"),
+        )
+        assert rejected.is_err
+        assert matched.is_ok
+        assert matched.value.session_id == "accept"
+        event = runtime._parse_json_event(
+            json.dumps({"event": "init", "conversation_id": "fresh", "init": {}})
+        )
+        assert event is not None
+
+
+@pytest.mark.asyncio
+async def test_resumes_can_be_interleaved_in_the_same_task() -> None:
+    import json
+
+    runtime = _make_runtime()
+
+    async def fake_exec(*command: str, **kwargs: object) -> _FakeProcess:
+        requested = command[command.index("--conversation") + 1]
+        return _FakeProcess(
+            [
+                json.dumps(
+                    {
+                        "event": "result",
+                        "result": {
+                            "conversation_id": requested,
+                            "status": "SUCCESS",
+                            "response": requested,
+                        },
+                    }
+                )
+            ]
+        )
+
+    with (
+        patch(
+            "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+            side_effect=fake_exec,
+        ),
+        patch.object(runtime, "_process_group_id", return_value=None),
+    ):
+        streams = [runtime.execute_task("continue", resume_session_id=s) for s in ("a", "b")]
+        results = [[], []]
+        pending = {0, 1}
+        while pending:
+            for index in sorted(pending):
+                try:
+                    results[index].append(await anext(streams[index]))
+                except StopAsyncIteration:
+                    pending.remove(index)
+        for messages, session_id in zip(results, ("a", "b"), strict=True):
+            assert messages[-1].is_final
+            assert not any(message.is_error for message in messages)
+            assert all(
+                message.resume_handle.native_session_id == session_id for message in messages
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("from_handle", [False, True])
+async def test_resume_after_runtime_drift_fails_before_fresh_launch(from_handle: bool) -> None:
+    runtime = _make_runtime()
+    handle = runtime._build_runtime_handle("requested-session") if from_handle else None
+    runtime._drift.observe("cli_executable", "test-only changed executable")
+    with patch("ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec") as spawn:
+        result = await runtime.execute_task_to_result(
+            "continue",
+            resume_handle=handle,
+            resume_session_id=None if from_handle else "requested-session",
+        )
+    spawn.assert_not_called()
+    assert result.is_err
+    assert "resume" in str(result.error).lower()
+
+
+@pytest.mark.asyncio
+async def test_fresh_conversation_after_runtime_drift_remains_available() -> None:
+    import json
+
+    runtime = _make_runtime()
+    runtime._drift.observe("cli_executable", "test-only changed executable")
+
+    async def fake_exec(*command: str, **kwargs: object) -> _FakeProcess:
+        assert "--conversation" not in command
+        return _FakeProcess(
+            [
+                json.dumps(
+                    {
+                        "event": "result",
+                        "result": {
+                            "conversation_id": "new-session",
+                            "status": "SUCCESS",
+                            "response": "fresh",
+                        },
+                    }
+                )
+            ]
+        )
+
+    with patch(
+        "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+        side_effect=fake_exec,
+    ):
+        result = await runtime.execute_task_to_result("new task")
+    assert result.is_ok
+    assert result.value.session_id == "new-session"
 
 
 @pytest.mark.parametrize(
