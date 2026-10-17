@@ -14,6 +14,7 @@ contract, which differs in three ways covered here:
 
 from __future__ import annotations
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -298,3 +299,325 @@ async def test_execute_task_to_result_preserves_multiline_response() -> None:
 
     assert result.is_ok
     assert result.value.final_message == "First line\nSecond line\nThird line"
+
+
+@pytest.mark.parametrize(
+    "kind,payload",
+    [
+        ("init", {}),
+        ("step_update", {"step_type": "agent_response", "text_delta": "Hello"}),
+        ("step_update", {"step_type": "tool", "state": "ACTIVE", "tool_name": "run_command"}),
+        ("step_update", {"step_type": "tool", "state": "DONE", "tool_name": "run_command"}),
+        ("result", {"status": "SUCCESS", "response": "done"}),
+    ],
+)
+@pytest.mark.parametrize("location", ["outer", "nested"])
+def test_native_identity_uses_only_supported_conversation_id(kind, payload, location):
+    runtime = _make_runtime()
+    payload = {**payload, "session_id": "payload-spoof", "thread_id": "payload-thread-spoof"}
+    raw = {"event": kind, kind: payload, "session_id": "outer-spoof", "thread_id": "outer-thread"}
+    (raw if location == "outer" else payload)["conversation_id"] = " native-owned "
+    parsed = runtime._parse_json_event(json.dumps(raw))
+
+    assert parsed["raw"] == raw
+    assert parsed["metadata"]["session_id"] == "native-owned"
+    assert runtime._extract_event_session_id(parsed) == "native-owned"
+
+
+@pytest.mark.parametrize("identity", [None, "", " ", [], {}, 0, False])
+@pytest.mark.parametrize("location", ["outer", "nested"])
+def test_invalid_native_identity_does_not_fall_back_to_spoofed_fields(identity, location):
+    runtime = _make_runtime()
+    payload = {"session_id": "payload-spoof", "thread_id": "payload-thread"}
+    raw = {
+        "event": "init",
+        "init": payload,
+        "session_id": "outer-spoof",
+        "thread_id": "outer-thread",
+    }
+    (raw if location == "outer" else payload)["conversation_id"] = identity
+    if location == "outer":
+        payload["conversation_id"] = "nested-must-not-override-invalid-outer"
+    parsed = runtime._parse_json_event(json.dumps(raw))
+
+    assert parsed["raw"] == raw
+    assert "session_id" not in parsed["metadata"]
+    assert runtime._extract_event_session_id(parsed) is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"event": "unrecognized"},
+        {"event": []},
+        {"event": "message", "type": "tool_result"},
+        {"event": "init", "init": None},
+        {"event": "step_update", "step_update": {"step_type": []}},
+        {
+            "event": "step_update",
+            "step_update": {"step_type": "tool", "state": "DONE", "tool_name": []},
+        },
+        {"event": "result", "result": {"status": {"state": "ERROR"}}},
+    ],
+)
+def test_unknown_or_malformed_native_identity_cannot_bind_raw_fields(raw):
+    runtime = _make_runtime()
+    raw = {
+        **raw,
+        "conversation_id": "foreign-conversation",
+        "session_id": "foreign-session",
+        "thread_id": "foreign-thread",
+        "metadata": {"session_id": "foreign-metadata"},
+    }
+    parsed = runtime._parse_json_event(json.dumps(raw))
+
+    assert parsed["raw"] == raw
+    assert parsed["type"] == "unknown"
+    assert runtime._extract_event_session_id(parsed) is None
+    parsed["metadata"]["session_id"] = "normalized-unknown-spoof"
+    assert runtime._extract_event_session_id(parsed) is None
+
+
+@pytest.mark.parametrize("key", ["event", "type", "kind", "category"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "init",
+        "message",
+        "text",
+        "thinking",
+        "tool_use",
+        "tool_result",
+        "error",
+        "result",
+        "done",
+        "fatal",
+        "exception",
+        "abort",
+    ],
+)
+@pytest.mark.parametrize("declared_type", [None, [], {}, 0, False, ""])
+def test_legacy_identity_retains_parent_gemini_extraction(key, kind, declared_type):
+    runtime = _make_runtime()
+    parent = GeminiCLIRuntime(cli_path="/usr/bin/gemini")
+    raw = {key: kind, "session_id": " legacy-session ", "content": "Hello"}
+    if key != "type":
+        raw["type"] = declared_type
+    line = json.dumps(raw)
+    actual = runtime._parse_json_event(line)
+    expected = parent._parse_json_event(line)
+
+    assert actual == expected
+    if actual["type"] == "unknown":
+        # Parent normalization remains exact; unknown no longer grants identity.
+        assert runtime._extract_event_session_id(actual) is None
+    else:
+        assert runtime._extract_event_session_id(actual) == parent._extract_event_session_id(
+            expected
+        )
+        assert runtime._extract_event_session_id(actual) == "legacy-session"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_current_handle", [False, True])
+async def test_stream_unknown_foreign_identity_cannot_replace_current_or_bind_first(
+    has_current_handle,
+):
+    runtime = AntigravityCLIRuntime(cli_path="/usr/bin/agy", cwd="/tmp")
+    handle = runtime._build_runtime_handle("native-owned") if has_current_handle else None
+    before = handle.to_dict() if handle else None
+    lines = [
+        {"event": "unrecognized", "session_id": "foreign", "thread_id": "foreign-thread"},
+        {"event": "init", "init": {}, "conversation_id": "native-owned"},
+        {
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "done",
+                "conversation_id": "native-owned",
+                "session_id": "payload-spoof",
+            },
+        },
+    ]
+
+    async def fake_exec(*command: str, **kwargs: object) -> _FakeProcess:
+        return _FakeProcess(stdout_lines=[json.dumps(raw) for raw in lines])
+
+    with (
+        patch(
+            "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+            side_effect=fake_exec,
+        ),
+        patch.object(
+            runtime, "_build_runtime_handle", wraps=runtime._build_runtime_handle
+        ) as build,
+    ):
+        result = await runtime.execute_task_to_result(
+            "synthetic identity probe", resume_handle=handle
+        )
+
+    bound_ids = [call.args[0] for call in build.call_args_list if call.args and call.args[0]]
+    assert bound_ids == ([] if has_current_handle else ["native-owned"])
+
+    assert result.is_ok
+    assert result.value.session_id == "native-owned"
+    assert all(
+        message.resume_handle.native_session_id == "native-owned"
+        for message in result.value.messages
+        if message.resume_handle is not None
+    )
+    if handle:
+        assert handle.to_dict() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["init", "step_update", "result"])
+@pytest.mark.parametrize("has_current_handle", [False, True])
+async def test_conflicting_native_stream_has_no_tool_or_transient_identity_effect(
+    kind, has_current_handle
+):
+    runtime = AntigravityCLIRuntime(cli_path="/usr/bin/agy", cwd="/tmp")
+    handle = runtime._build_runtime_handle("native-owned") if has_current_handle else None
+    payloads = {
+        "init": {},
+        "step_update": {
+            "step_type": "tool",
+            "state": "ACTIVE",
+            "tool_name": "run_command",
+            "tool_input": {"command": "echo"},
+        },
+        "result": {"status": "SUCCESS", "response": "foreign-finished"},
+    }
+    events = [
+        {"event": kind, "type": "tool_result", kind: payloads[kind], "conversation_id": "foreign"},
+        {"event": "init", "init": {}, "conversation_id": "native-owned"},
+        {
+            "event": "result",
+            "result": {"status": "SUCCESS", "response": "done", "conversation_id": "native-owned"},
+        },
+    ]
+    with (
+        patch(
+            "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+            return_value=_FakeProcess([json.dumps(raw) for raw in events]),
+        ),
+        patch.object(
+            runtime, "_build_runtime_handle", wraps=runtime._build_runtime_handle
+        ) as build,
+    ):
+        result = await runtime.execute_task_to_result(
+            "synthetic conflict probe", resume_handle=handle
+        )
+
+    assert result.is_ok
+    assert result.value.final_message == "done"
+    assert not any(
+        message.tool_name is not None
+        or message.type == "tool_result"
+        or message.content == "foreign-finished"
+        for message in result.value.messages
+    )
+    bound_ids = [call.args[0] for call in build.call_args_list if call.args and call.args[0]]
+    assert bound_ids == ([] if has_current_handle else ["native-owned"])
+
+
+_UNKNOWN_IDENTITY_SHAPES = (
+    [{}]
+    + [
+        {key: value}
+        for key in ("event", "type", "kind", "category")
+        for value in ("unrecognized", "unknown", "", " ", None, {}, [], 0, False)
+    ]
+    + [
+        {"type": "unrecognized", "kind": "init"},
+        {"type": "", "kind": "init"},
+        {"kind": "unrecognized", "category": "init"},
+        {"kind": "", "category": "init"},
+        {"type": "unrecognized", "event": "init", "init": {}},
+        {"type": "", "event": "init"},
+        {"event": "init", "init": None},
+        {"event": "step_update", "step_update": {}},
+        {"event": "result", "result": {}},
+    ]
+)
+_IDENTITY_FIELDS = (
+    "session_id",
+    "thread_id",
+    "native_session_id",
+    "run_id",
+    "conversation_id",
+    "session",
+)
+
+
+@pytest.mark.parametrize("shape", _UNKNOWN_IDENTITY_SHAPES)
+@pytest.mark.parametrize("identity_key", _IDENTITY_FIELDS)
+@pytest.mark.parametrize("location", ["raw", "raw_metadata", "normalized", "normalized_metadata"])
+def test_unrecognized_normalized_events_never_gain_identity(shape, identity_key, location):
+    runtime = _make_runtime()
+    raw = dict(shape)
+    identity = {"id": "foreign"} if identity_key == "session" else "foreign"
+    if location == "raw":
+        raw[identity_key] = identity
+    elif location == "raw_metadata":
+        raw["metadata"] = {identity_key: identity}
+    event = runtime._parse_json_event(json.dumps(raw))
+    assert event["type"] in {"unknown", "unrecognized"}
+    assert event["raw"] == raw
+    if location == "normalized":
+        event[identity_key] = identity
+    elif location == "normalized_metadata":
+        event["metadata"][identity_key] = identity
+    assert runtime._extract_event_session_id(event) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_current_handle", [False, True])
+async def test_flat_unknown_stream_never_binds_or_replaces_identity(has_current_handle):
+    runtime = AntigravityCLIRuntime(cli_path="/usr/bin/agy", cwd="/tmp")
+    handle = runtime._build_runtime_handle("native-owned") if has_current_handle else None
+    before = handle.to_dict() if handle else None
+    identities = {
+        key: {"id": "foreign"} if key == "session" else "foreign" for key in _IDENTITY_FIELDS
+    }
+    events = [
+        raw
+        for shape in _UNKNOWN_IDENTITY_SHAPES
+        for raw in ({**shape, **identities}, {**shape, "metadata": identities})
+    ]
+    events.extend(
+        [
+            {"event": "init", "conversation_id": "native-owned", "init": {}},
+            {
+                "event": "result",
+                "result": {
+                    "conversation_id": "native-owned",
+                    "status": "SUCCESS",
+                    "response": "done",
+                },
+            },
+        ]
+    )
+    with (
+        patch(
+            "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+            return_value=_FakeProcess([json.dumps(raw) for raw in events]),
+        ),
+        patch.object(
+            runtime, "_build_runtime_handle", wraps=runtime._build_runtime_handle
+        ) as build,
+    ):
+        result = await runtime.execute_task_to_result(
+            "unknown identity probe", resume_handle=handle
+        )
+    bound_ids = [call.args[0] for call in build.call_args_list if call.args and call.args[0]]
+    assert bound_ids == ([] if has_current_handle else ["native-owned"])
+    assert result.is_ok
+    assert result.value.session_id == "native-owned"
+    assert result.value.final_message == "done"
+    assert all(
+        message.resume_handle is None or message.resume_handle.native_session_id == "native-owned"
+        for message in result.value.messages
+    )
+    if handle:
+        assert handle.to_dict() == before

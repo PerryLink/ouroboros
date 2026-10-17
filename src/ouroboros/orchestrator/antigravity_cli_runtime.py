@@ -39,6 +39,9 @@ Custom CLI Path:
 
 from __future__ import annotations
 
+from dataclasses import replace
+from typing import Any
+
 import structlog
 
 from ouroboros.orchestrator.adapter import (
@@ -48,6 +51,11 @@ from ouroboros.orchestrator.adapter import (
     RuntimeHandle,
 )
 from ouroboros.orchestrator.gemini_cli_runtime import GeminiCLIRuntime
+from ouroboros.providers.antigravity_event_normalizer import (
+    AntigravityEventNormalizer,
+    is_legacy_gemini_event,
+    is_recognized_gemini_event_type,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -90,6 +98,42 @@ class AntigravityCLIRuntime(GeminiCLIRuntime):
     _default_llm_backend = "claude_code"
     _tempfile_prefix = "ouroboros-antigravity-"
     _max_resume_retries = 0  # agy print mode does not support targeted resume
+
+    def _extract_event_session_id(self, event: dict[str, Any]) -> str | None:
+        """Trust canonical native identity; preserve legacy Gemini extraction."""
+        if not is_recognized_gemini_event_type(event.get("type")):
+            return None
+        raw = event.get("raw")
+        if not isinstance(raw, dict) or is_legacy_gemini_event(raw):
+            return super()._extract_event_session_id(event)
+        if event.get("type") not in {"init", "message", "tool_use", "tool_result", "result"}:
+            return None
+        metadata = event.get("metadata")
+        session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
+        return session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+
+    def _parse_json_event(self, line: str) -> dict[str, Any] | None:
+        if not line.strip():
+            return None
+        return AntigravityEventNormalizer().normalize_line(line)
+
+    def _convert_event(
+        self, event: dict[str, Any], current_handle: RuntimeHandle | None, *, item_scope: Any = None
+    ) -> list[AgentMessage]:
+        messages = super()._convert_event(event, current_handle, item_scope=item_scope)
+        metadata = event.get("metadata", {})
+        if event.get("type") == "result" and event.get("is_error"):
+            return [
+                AgentMessage(
+                    type="result",
+                    content=event.get("content", ""),
+                    data={"subtype": "error", "terminal": True, "metadata": metadata},
+                    resume_handle=current_handle,
+                )
+            ]
+        if metadata.get("text_delta"):
+            messages = [replace(m, data={**m.data, "text_delta": True}) for m in messages]
+        return messages
 
     # -- Permission mode overrides -----------------------------------------
 
@@ -192,6 +236,12 @@ class AntigravityCLIRuntime(GeminiCLIRuntime):
         non-empty assistant lines with newlines so the orchestrator's
         ``final_message`` reconstructs the complete response.
         """
+        if message.tool_name or message.type != "assistant" or message.data.get("thinking"):
+            return last_content
+        if message.data.get("terminal"):
+            return message.content
+        if message.data.get("text_delta"):
+            return last_content + message.content
         if not message.content:
             return last_content
         return f"{last_content}\n{message.content}" if last_content else message.content
